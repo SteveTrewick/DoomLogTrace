@@ -1,4 +1,4 @@
-# LogTap – Spec
+# DoomLogTrace – Spec
 
 ## Goal
 Build a small Swift Package that provides **debug-focused**, **non-critical**, **non-realtime** instrumentation by reading Apple Unified Logging entries for the **current process** and exposing them as an `AsyncSequence`.
@@ -27,190 +27,127 @@ This is intended as “tools to make tools” scaffolding for build/debug sessio
 Expose a minimal and stable API surface.
 
 ### Types
-#### `public struct LogTapConfig: Sendable`
-Configuration for a tap instance.
+#### `public struct DoomLogTraceConfig: Sendable`
+Configuration for a trace instance.
 
 Fields:
-- `subsystem: String?`  
+- `subsystem: String?`
 - `category: String?`
-- `minimumLevel: LogTapLevel` (default: `.debug`)
+- `minimumLevel: DoomLogTraceLevel` (default: `.debug`)
 - `pollInterval: Duration` (default: 250ms)
-- `lookback: Duration` (default: 2s) – initial “catch-up” window
-- `maxEventsPerPoll: Int` (default: 2000) – backpressure guard
-- `dedupeWindow: Int` (default: 4096) – number of recent event fingerprints to remember
+- `lookback: Duration` (default: 2s)
+- `maxEventsPerPoll: Int` (default: 2000)
+- `dedupeWindow: Int` (default: 4096)
 - `includeSignposts: Bool` (default: false)
 - `includeTraceIDs: Bool` (default: true if available)
 - `enabledInRelease: Bool` (default: false)
 
-#### `public enum LogTapLevel: Int, Sendable, Comparable`
-Represents levels in increasing severity:
+#### `public enum DoomLogTraceLevel: Int, Sendable, Comparable`
 - `debug`, `info`, `notice`, `error`, `fault`
 
-Provide a comparator and mapping from `OSLogEntryLog.Level` when available.
-
-#### `public struct LogEvent: Sendable, Codable`
-Normalized event model (not tied to OSLog types):
+#### `public struct DoomLogTraceEvent: Sendable, Codable`
 - `timestamp: Date`
-- `level: LogTapLevel`
+- `level: DoomLogTraceLevel`
 - `subsystem: String?`
 - `category: String?`
 - `process: String?`
 - `pid: Int?`
-- `threadID: UInt64?` (if obtainable)
+- `threadID: UInt64?`
 - `message: String`
-- `activityID: UInt64?` (if obtainable)
-- `raw: [String:String]?` (optional extra fields for forward compat)
+- `activityID: UInt64?`
+- `raw: [String:String]?`
 
 ### Entry Point
-#### `public struct LogTap: Sendable`
-Create a tap that reads unified log entries and emits `LogEvent`s.
-
-API:
-- `public init(config: LogTapConfig) throws`
-- `public func events() -> AsyncThrowingStream<LogEvent, Error>`
+#### `public struct DoomLogTrace: Sendable`
+- `init(config: DoomLogTraceConfig) throws`
+- `func events() -> AsyncThrowingStream<DoomLogTraceEvent, Error>`
 
 Convenience:
-- `public static func makeDefault(subsystem: String, category: String? = nil) -> LogTapConfig`
-- `public static var isSupported: Bool` (availability check)
-- `public static var isEnabledByBuild: Bool`  
-  - true in DEBUG
-  - false in Release unless `enabledInRelease == true`
+- `static func makeDefault(subsystem: String, category: String? = nil) -> DoomLogTraceConfig`
+- `static var isSupported: Bool`
+- `static var isEnabledByBuild: Bool`
 
-### Error Model
-#### `public enum LogTapError: Error, Sendable`
+### Errors
+#### `public enum DoomLogTraceError: Error, Sendable`
 - `unsupportedPlatform`
 - `storeUnavailable(String)`
 - `permissionDenied(String)`
 - `iterationFailed(String)`
 - `disabledInThisBuild`
 
-Errors should be human-readable and include a brief “what to do next” hint.
-
 ## Behavior Requirements
 ### Store Scope
-- Default to `OSLogStore(scope: .currentProcessIdentifier)`.
+- `OSLogStore(scope: .currentProcessIdentifier)`
 
-### Streaming Model (Polling)
-- Implement “fake streaming” by polling:
-  1. establish a cursor date = `now - lookback`
-  2. on each tick:
-     - compute store position at cursor date
-     - enumerate entries matching predicate
-     - emit new entries
-     - advance cursor date to newest emitted timestamp + epsilon
+### Streaming Model
+Polling-based “fake stream”:
+1. cursor = `now - lookback`
+2. enumerate forward
+3. emit
+4. advance cursor + epsilon
 
 ### Filtering
-- Hard filter with `NSPredicate` when possible:
-  - subsystem/category
-  - process/pid when available
-- Soft filter in Swift:
-  - minimum level mapping
-  - include/exclude signposts
-- Do not rely on `composedMessage` parsing beyond taking it as the message string.
+- Hard filter: `NSPredicate` (subsystem/category/process)
+- Soft filter: level, signposts
 
 ### De-duplication
-Because polling can re-read at the cursor boundary:
-- Maintain an LRU-ish ring of recent fingerprints (`dedupeWindow`).
-- Fingerprint suggestion:
-  - `timestamp.timeIntervalSinceReferenceDate`
-  - `level`
-  - `message`
-  - `subsystem/category` (if present)
-- If a fingerprint is already in the ring, skip.
+- Fingerprint ring buffer (`dedupeWindow`)
+- Skip duplicates at cursor boundary
 
 ### Backpressure
-If more than `maxEventsPerPoll` are encountered in one tick:
-- Emit up to the cap.
-- Advance cursor date to the latest timestamp seen among scanned events (even if not emitted) to avoid getting stuck.
-- Optionally log a diagnostic to `Logger(subsystem:..., category:"LogTap")` indicating truncation (DEBUG only).
+- Cap at `maxEventsPerPoll`
+- Advance cursor even when truncating
+- DEBUG-only diagnostic via `Logger(subsystem:…, category:"DoomLogTrace")`
 
-### Cancellation / Termination
-- `AsyncThrowingStream` should cancel cleanly:
-  - stop polling when task is cancelled
-  - finish stream on cancellation without throwing
-- Provide `onTermination` to cancel the polling task.
+### Cancellation
+- Clean `AsyncThrowingStream` termination
+- Task cancellation aware
 
 ### Build Gating
-- Default: compile and run only in DEBUG builds.
-- In Release:
-  - if `enabledInRelease == false`, constructing `LogTap` throws `disabledInThisBuild`.
-  - If enabled, behavior is the same but be conservative about overhead (increase poll interval minimum to e.g. 1s).
+- DEBUG-only by default
+- Release throws unless `enabledInRelease == true`
 
-## Output Helpers (Optional, but useful)
-Include small utilities (non-essential but handy):
-
+## Utilities (Optional)
 ### JSONL Writer
-`public struct LogEventJSONLWriter`
-- init with `FileHandle` or file URL
-- `func write(_ event: LogEvent) throws`
-- newline-delimited JSON, one event per line
+`DoomLogTraceJSONLWriter`
 
-### In-memory Ring Buffer
-`public actor LogEventRingBuffer`
-- fixed capacity
-- `append(_:)`, `snapshot() -> [LogEvent]`
+### Ring Buffer
+`DoomLogTraceRingBuffer`
 
 ## Package Structure
-- Package name: `LogTap`
+- Package: `DoomLogTrace`
 - Targets:
-  - `LogTap` (library)
-  - `LogTapTests` (unit tests)
+  - `DoomLogTrace`
+  - `DoomLogTraceTests`
 
-Suggested folders:
-- `Sources/LogTap/LogTap.swift`
-- `Sources/LogTap/LogTapConfig.swift`
-- `Sources/LogTap/LogEvent.swift`
-- `Sources/LogTap/Internal/OSLogStoreStreamer.swift`
-- `Sources/LogTap/Utilities/JSONLWriter.swift` (optional)
-- `Sources/LogTap/Utilities/RingBuffer.swift` (optional)
+Suggested layout:
+- `Sources/DoomLogTrace/DoomLogTrace.swift`
+- `Sources/DoomLogTrace/DoomLogTraceConfig.swift`
+- `Sources/DoomLogTrace/DoomLogTraceEvent.swift`
+- `Sources/DoomLogTrace/Internal/OSLogStoreStreamer.swift`
 
 ## Tests
-Write unit tests that do not require accessing the real unified log store.
+- Mockable entry source
+- De-dupe
+- Cursor advance
+- Backpressure
+- Cancellation
+- Build gating
 
-Approach:
-- Abstract the “entry source” behind a protocol:
-  - `LogEntrySource` with `getEntries(since: Date) -> [LogEvent]` (or similar)
-- Provide:
-  - `OSLogStoreEntrySource` (real)
-  - `MockEntrySource` (tests)
-
-Test cases:
-- De-dupe works (same fingerprint repeated doesn’t emit twice)
-- Cursor advances correctly
-- Backpressure cap enforced
-- Cancellation stops polling
-- Build gating (Release path throws unless enabled flag true)
-- JSONL writer produces valid JSON per line (if implemented)
-
-## Example Usage (README snippet)
-Provide a minimal example in the README or doc comment:
-
+## Example
 ```swift
-import LogTap
+import DoomLogTrace
 
-let config = LogTapConfig(
+let config = DoomLogTraceConfig(
   subsystem: "com.yourco.yourapp",
   category: "FailQuiet",
   minimumLevel: .debug
 )
 
-let tap = try LogTap(config: config)
+let trace = try DoomLogTrace(config: config)
 
 Task {
-  for try await e in tap.events() {
+  for try await e in trace.events() {
     print("\(e.timestamp) [\(e.level)] \(e.message)")
   }
 }
-```
-
-## Performance Notes
-- Polling interval defaults to 250ms, but should clamp to >= 100ms.
-- Avoid heavy string processing.
-- Use predicates to narrow results early.
-- Keep dedupe ring bounded.
-
-## Deliverables
-- Working Swift Package committed to repo.
-- Clean public API and docs/comments.
-- Tests passing.
-- No private API usage.
